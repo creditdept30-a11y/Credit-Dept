@@ -25,6 +25,8 @@ import {
 import { ChalanRecord } from "./types";
 import CameraScanner from "./components/CameraScanner";
 import ChalanVisualizer from "./components/ChalanVisualizer";
+import MobileScannerView from "./components/MobileScannerView";
+import { Smartphone, Wifi } from "lucide-react";
 
 // Initial sample records to populate empty state professionally
 const INITIAL_SAMPLES: ChalanRecord[] = [
@@ -61,13 +63,30 @@ const INITIAL_SAMPLES: ChalanRecord[] = [
 ];
 
 export default function App() {
+  // Routing Intercept: render Mobile Scanner View if URL parameter 'session' or 's' is supplied
+  const urlParams = new URL(window.location.href);
+  const targetSession = urlParams.searchParams.get("session") || urlParams.searchParams.get("s");
+  if (targetSession) {
+    return <MobileScannerView sessionId={targetSession} />;
+  }
+
   // App state
   const [records, setRecords] = useState<ChalanRecord[]>([]);
-  const [activeTab, setActiveTab] = useState<"camera" | "upload" | "paste">("camera");
+  const [activeTab, setActiveTab] = useState<"camera" | "upload" | "paste" | "mobile">("camera");
   const [pastedText, setPastedText] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [loadingProgress, setLoadingProgress] = useState("");
   const [apiError, setApiError] = useState<string | null>(null);
+
+  // Real-time remote mobile sync states (PC Desktop browser side)
+  const [mobileSessionId, setMobileSessionId] = useState<string | null>(null);
+  const [mobileStreamStatus, setMobileStreamStatus] = useState<"idle" | "waiting" | "connected" | "received" | "error">("idle");
+  const [mobileError, setMobileError] = useState<string | null>(null);
+  const [isInitializingMobile, setIsInitializingMobile] = useState(false);
+
+  // Streams & Poll triggers pointers references for clean garbage collection on component unmount
+  const esRef = React.useRef<EventSource | null>(null);
+  const pollIntervalRef = React.useRef<any | null>(null);
 
   // Active scanned buffer state before saving
   const [scannedResult, setScannedResult] = useState<Omit<ChalanRecord, "id" | "scannedAt"> | null>(null);
@@ -91,6 +110,117 @@ export default function App() {
     verificationStatus: "Verification Pending" as "Verified" | "Verification Pending" | "Invalid/Unverified",
     notes: ""
   });
+
+  // Reusable stream clean teardown
+  const cleanupMobileSync = () => {
+    if (esRef.current) {
+      esRef.current.close();
+      esRef.current = null;
+    }
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+  };
+
+  // Start back-end polling fallback if browser blocks EventSource streaming
+  const startPollingSyncFallback = (sId: string) => {
+    console.log("[Desktop Poll] SSE blocked or failed, started interval fallback for session:", sId);
+    let checkAttempts = 0;
+    
+    pollIntervalRef.current = setInterval(async () => {
+      checkAttempts++;
+      if (checkAttempts > 150) { // Safety timeout after ~5 mins of idling
+        cleanupMobileSync();
+        setMobileStreamStatus("error");
+        setMobileError("Pairing session timed out. Please refresh or regenerate the QR below.");
+        return;
+      }
+      
+      try {
+        const response = await fetch(`/api/session/${sId}/status`);
+        if (!response.ok) return;
+        const details = await response.json();
+        
+        if (details.scannedText) {
+          setMobileStreamStatus("received");
+          cleanupMobileSync();
+          handleVerifyRequest({ qrText: details.scannedText });
+        } else if (details.isPcConnected || details.status === "connected") {
+          setMobileStreamStatus("connected");
+        }
+      } catch (err) {
+        console.warn("[Polling Sync Warn] Status check failed:", err);
+      }
+    }, 2000);
+  };
+
+  // Automated backend handshake call to stream scans wirelessly
+  const startRemoteMobileSession = async () => {
+    cleanupMobileSync();
+    setIsInitializingMobile(true);
+    setMobileError(null);
+    setMobileStreamStatus("waiting");
+
+    try {
+      // 1. POST route to register pairing session ID
+      const response = await fetch("/api/session/start", { method: "POST" });
+      if (!response.ok) throw new Error("Could not construct cloud synchronization pipe on the server.");
+      const payload = await response.json();
+      const sId = payload.sessionId;
+      setMobileSessionId(sId);
+
+      // 2. Open standard EventSource stream listener on current session
+      const stream = new EventSource(`/api/session/${sId}/stream`);
+      esRef.current = stream;
+
+      stream.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "registered") {
+            setMobileStreamStatus("waiting");
+          } else if (msg.type === "mobile_connected") {
+            setMobileStreamStatus("connected");
+          } else if (msg.type === "scan") {
+            setMobileStreamStatus("received");
+            cleanupMobileSync();
+            handleVerifyRequest({ qrText: msg.qrText });
+          }
+        } catch (jsonErr) {
+          console.error("Payload decoding failure", jsonErr);
+        }
+      };
+
+      stream.onerror = (err) => {
+        console.warn("[SSE Connection Warn] Re-routing real-time stream via continuous short polling backup:", err);
+        stream.close();
+        esRef.current = null;
+        startPollingSyncFallback(sId);
+      };
+
+    } catch (err) {
+      console.error("[Realtime Sync Initiation Fault]", err);
+      setMobileError("Failed to initiate secure wireless sync link. Please try again.");
+      setMobileStreamStatus("error");
+    } finally {
+      setIsInitializingMobile(false);
+    }
+  };
+
+  // Switch tabs & trigger sync lifecycles automatically
+  useEffect(() => {
+    if (activeTab === "mobile") {
+      startRemoteMobileSession();
+    } else {
+      cleanupMobileSync();
+      setMobileSessionId(null);
+      setMobileStreamStatus("idle");
+      setMobileError(null);
+    }
+    return () => {
+      cleanupMobileSync();
+    };
+  }, [activeTab]);
 
   // Load from localstorage on boot
   useEffect(() => {
@@ -586,6 +716,18 @@ export default function App() {
                   <Clipboard className="w-3.5 h-3.5 text-indigo-600" />
                   Paste QR Data
                 </button>
+                <button
+                  id="tab-mobile-btn"
+                  onClick={() => { setActiveTab("mobile"); setApiError(null); }}
+                  className={`flex-1 py-2 px-3 rounded-xl text-xs font-semibold tracking-wide transition duration-150 flex items-center justify-center gap-1.5 ${
+                    activeTab === "mobile" 
+                      ? "bg-white text-slate-900 shadow-sm border border-slate-200/40" 
+                      : "text-slate-500 hover:text-slate-800"
+                  }`}
+                >
+                  <Smartphone className="w-3.5 h-3.5 text-indigo-600" />
+                  Scan with Phone
+                </button>
               </div>
 
               {/* Tab Viewports contents */}
@@ -693,6 +835,143 @@ export default function App() {
                       <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
                       Verify Link with Proxy Handshake
                     </button>
+                  </div>
+                )}
+
+                {activeTab === "mobile" && (
+                  <div className="flex flex-col md:flex-row gap-6 items-center md:items-stretch font-sans">
+                    {/* Left Panel: Pairing instructions & QR Code */}
+                    <div className="flex-1 flex flex-col justify-center bg-slate-50 border border-slate-150 p-6 rounded-2xl">
+                      <div className="flex items-start gap-3">
+                        <div className="w-10 h-10 rounded-xl bg-indigo-50 flex items-center justify-center shrink-0 border border-indigo-150">
+                          <Smartphone className="w-5 h-5 text-indigo-600 animate-pulse" />
+                        </div>
+                        <div>
+                          <h4 className="text-slate-800 text-sm font-bold tracking-tight">Wireless Mobilizer Scan</h4>
+                          <p className="text-[10px] text-slate-400 mt-1 font-medium leading-relaxed">
+                            No camera connected on this PC? Uncomfortable using your webcam? Scan other physical chalans instantly with your personal cell-phone!
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-col gap-3 mt-4 text-xs font-medium text-slate-600 leading-normal">
+                        <div className="flex gap-2">
+                          <span className="w-5 h-5 shrink-0 rounded-full bg-slate-200 flex items-center justify-center font-bold text-[10px] text-slate-700">1</span>
+                          <p>Point your smartphone camera at the QR code shown here, then tap the popup message to request pairing link.</p>
+                        </div>
+                        <div className="flex gap-2">
+                          <span className="w-5 h-5 shrink-0 rounded-full bg-slate-200 flex items-center justify-center font-bold text-[10px] text-slate-700">2</span>
+                          <p>Focus your cell-phone camera on any bank treasury printed A-Chalan chalan barcode slip.</p>
+                        </div>
+                        <div className="flex gap-2">
+                          <span className="w-5 h-5 shrink-0 rounded-full bg-slate-200 flex items-center justify-center font-bold text-[10px] text-slate-700">3</span>
+                          <p>Watch as your computer instantly detects the scanned token, launches the API verify auditor, and inserts everything auto-filled!</p>
+                        </div>
+                      </div>
+
+                      {/* Display direct fallback pairing text anchor link */}
+                      {mobileSessionId && (
+                        <div className="mt-5 pt-4 border-t border-slate-200/80">
+                          <p className="text-[9px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 font-sans">Trouble scanning? Open Link on Mobile:</p>
+                          <div className="flex gap-1.5 items-center bg-white p-2 rounded-xl border border-slate-200 shadow-sm font-sans">
+                            <input 
+                              type="text" 
+                              readOnly 
+                              value={`${window.location.origin}?session=${mobileSessionId}`}
+                              className="font-mono text-[10px] text-slate-500 bg-transparent outline-none flex-1 truncate select-all px-1.5"
+                            />
+                            <button
+                              onClick={() => {
+                                navigator.clipboard.writeText(`${window.location.origin}?session=${mobileSessionId}`);
+                              }}
+                              className="px-2.5 py-1 bg-slate-800 text-white font-bold text-[9px] hover:bg-slate-700 rounded-lg active:scale-95 transition whitespace-nowrap"
+                            >
+                              Copy Link
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Right Panel: Live Link Visual pairing and stream indicators */}
+                    <div className="w-[300px] shrink-0 flex flex-col items-center justify-center p-6 border border-slate-200 bg-white rounded-2xl shadow-sm text-center gap-4 relative overflow-hidden font-sans">
+                      {isInitializingMobile ? (
+                        <div className="flex flex-col items-center justify-center py-12 gap-3">
+                          <div className="w-10 h-10 rounded-full border-4 border-indigo-600 border-t-transparent animate-spin" />
+                          <p className="text-xs text-slate-500 font-bold">Spinning up secure wireless channel...</p>
+                        </div>
+                      ) : mobileSessionId ? (
+                        <>
+                          {/* QR RENDER */}
+                          <div className="relative p-3 bg-white border border-slate-200 rounded-2xl shadow-inner group overflow-hidden">
+                            <img
+                              referrerPolicy="no-referrer"
+                              src={`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(`${window.location.origin}?session=${mobileSessionId}`)}`}
+                              alt="Scan Pairing Code"
+                              className="w-[180px] h-[180px] object-contain block transition duration-350"
+                            />
+                            {/* Visual highlight mask in corresponding statuses */}
+                            {mobileStreamStatus === "connected" && (
+                              <div className="absolute inset-0 bg-emerald-500/95 flex flex-col items-center justify-center text-white p-4 font-sans animate-fade-in">
+                                <CheckCircle2 className="w-10 h-10 animate-bounce" />
+                                <span className="text-xs font-bold mt-2">Mobile Synchronized!</span>
+                                <span className="text-[10px] opacity-80 mt-1">Ready for scans...</span>
+                              </div>
+                            )}
+                            {mobileStreamStatus === "received" && (
+                              <div className="absolute inset-0 bg-indigo-600/95 flex flex-col items-center justify-center text-white p-4 font-sans animate-fade-in">
+                                <div className="w-8 h-8 rounded-full border-2 border-white border-t-transparent animate-spin mb-1" />
+                                <span className="text-xs font-bold mt-1">Payload Received!</span>
+                                <span className="text-[10px] opacity-80">Syncing database...</span>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* DYNAMIC REAL-TIME STATUS BLOCK */}
+                          <div className="w-full flex flex-col items-center gap-2 pt-1 border-t border-slate-100 mt-1">
+                            <div className="flex items-center gap-1.5 px-3 py-1 bg-slate-50 border border-slate-150 rounded-full shadow-inner leading-none">
+                              <span className={`w-1.5 h-1.5 rounded-full ${
+                                mobileStreamStatus === "connected" 
+                                  ? "bg-emerald-500 animate-pulse" 
+                                  : mobileStreamStatus === "waiting" 
+                                  ? "bg-indigo-500 animate-ping" 
+                                  : mobileStreamStatus === "received" 
+                                  ? "bg-blue-500 animate-spin"
+                                  : "bg-amber-500"
+                              }`} />
+                              <span className="text-[9px] font-bold text-slate-500 uppercase tracking-wider">
+                                {mobileStreamStatus === "waiting" && "Waiting for device..."}
+                                {mobileStreamStatus === "connected" && "MOBILE DEVICE CONNECTED"}
+                                {mobileStreamStatus === "received" && "SCAN COMPLETED"}
+                                {mobileStreamStatus === "error" && "PAIRING EXPIRED"}
+                              </span>
+                            </div>
+                            
+                            <p className="text-[10px] text-slate-400 font-medium leading-normal max-w-[220px]">
+                              {mobileStreamStatus === "waiting" && "Point your handheld camera at this screen to instantly connect."}
+                              {mobileStreamStatus === "connected" && "All set! Please scan Chalan ledger now. Desktop will auto-fill."}
+                              {mobileStreamStatus === "received" && "Data received! Running compliance and scraping checks..."}
+                              {mobileStreamStatus === "error" && "Pairing session failed or expired. Please reset below."}
+                            </p>
+                          </div>
+                        </>
+                      ) : (
+                        <div className="flex flex-col items-center justify-center py-12 gap-3">
+                          <AlertCircle className="w-8 h-8 text-rose-500" />
+                          <p className="text-xs text-slate-500 font-bold">{mobileError || "Pairing channel offline"}</p>
+                        </div>
+                      )}
+
+                      {/* Bridge Regenerator / Troubleshooting Button */}
+                      <button
+                        type="button"
+                        onClick={startRemoteMobileSession}
+                        className="mt-1 w-full py-2 bg-slate-50 hover:bg-slate-100 text-slate-600 font-semibold rounded-xl text-[10px] tracking-wide transition border border-slate-200 active:scale-95 flex items-center justify-center gap-1.5"
+                      >
+                        <RefreshCw className="w-3 h-3 text-slate-500" />
+                        Regenerate Pairing Key
+                      </button>
+                    </div>
                   </div>
                 )}
 

@@ -6,6 +6,29 @@
     <title>My Google AI Studio App</title>
     <script>
       (function() {
+        // Suppress benign Vite WebSocket / HMR uncaught runtime exceptions in dev environments
+        window.addEventListener('unhandledrejection', function(event) {
+          var reason = event.reason;
+          if (reason) {
+            var msg = reason.message || String(reason);
+            if (msg.includes('WebSocket') || msg.includes('websocket') || msg.includes('vite') || msg.includes('web-socket')) {
+              console.log('Silenced benign web-socket unhandled rejection in preview: ' + msg);
+              event.preventDefault();
+              event.stopPropagation();
+            }
+          }
+        });
+
+        // Also suppress error events for WebSockets/Vite HMR in iframe sandboxes
+        window.addEventListener('error', function(event) {
+          var msg = event.message || '';
+          if (msg.includes('WebSocket') || msg.includes('websocket') || msg.includes('vite')) {
+            console.log('Silenced benign web-socket error event: ' + msg);
+            event.preventDefault();
+            event.stopPropagation();
+          }
+        }, true);
+
         try {
           // Check if window.fetch has only a getter by testing descriptor or setting it
           var desc = Object.getOwnPropertyDescriptor(window, 'fetch') || Object.getOwnPropertyDescriptor(Object.getPrototypeOf(window), 'fetch');

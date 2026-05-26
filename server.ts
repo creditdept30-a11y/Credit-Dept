@@ -288,11 +288,121 @@ app.post("/api/verify-chalan", async (req, res) => {
   }
 });
 
+// --- REMOTE MOBILE SCANNING REAL-TIME HANDSHAKE CONTROLLER ---
+const sseClients = new Map<string, any>(); // sessionId -> express.Response
+const sessionData = new Map<string, string>(); // sessionId -> lastScannedText
+
+// Initialize / Ping / Start a mobile scanning session
+app.post("/api/session/start", (req, res) => {
+  const sessionId = "chalan_" + Math.random().toString(36).substring(2, 11).toUpperCase();
+  sessionData.delete(sessionId); // ensure completely fresh slate
+  res.json({ success: true, sessionId });
+});
+
+// SSE Handshake Stream for PC/Desktop browser
+app.get("/api/session/:sessionId/stream", (req, res) => {
+  const { sessionId } = req.params;
+  
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  if (res.flushHeaders) {
+    res.flushHeaders();
+  }
+
+  // Store active client SSE response descriptor
+  sseClients.set(sessionId, res);
+  console.log(`[SSE Handshake] PC Client registered session: ${sessionId}`);
+
+  // Send initial signal
+  res.write(`data: ${JSON.stringify({ type: "registered", sessionId, status: "waiting_mobile" })}\n\n`);
+
+  // Simple heartbeat to maintain socket integrity under reverse-proxy layers
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(`data: ${JSON.stringify({ type: "ping" })} \n\n`);
+    } catch (e) {
+      clearInterval(heartbeat);
+    }
+  }, 10000);
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    if (sseClients.get(sessionId) === res) {
+      sseClients.delete(sessionId);
+    }
+    console.log(`[SSE Close] Client session connection closed: ${sessionId}`);
+  });
+});
+
+// Mobile scanner notifying PC browser that mobile is ready/connected
+app.post("/api/session/:sessionId/join", (req, res) => {
+  const { sessionId } = req.params;
+  console.log(`[Mobile Joined] Handshake pairing established with session: ${sessionId}`);
+  
+  const clientRes = sseClients.get(sessionId);
+  if (clientRes) {
+    try {
+      clientRes.write(`data: ${JSON.stringify({ type: "mobile_connected" })}\n\n`);
+      res.json({ success: true, message: "PC notified of your connection." });
+    } catch (e) {
+      res.status(500).json({ error: "Failed to transmit pairing signal to desktop client." });
+    }
+  } else {
+    res.json({ success: true, warning: "Mobile ready, but waiting for PC client streaming connection." });
+  }
+});
+
+// Payload transmission endpoint called when mobile camera captures a QR or barcode success
+app.post("/api/session/:sessionId/scan", (req, res) => {
+  const { sessionId } = req.params;
+  const { qrText } = req.body;
+
+  if (!qrText) {
+    res.status(400).json({ error: "No QR text payload supplied." });
+    return;
+  }
+
+  console.log(`[Realtime Sync] Transmitting QR value to Session ${sessionId}: "${qrText}"`);
+  sessionData.set(sessionId, qrText);
+
+  const clientRes = sseClients.get(sessionId);
+  if (clientRes) {
+    try {
+      clientRes.write(`data: ${JSON.stringify({ type: "scan", qrText })}\n\n`);
+      res.json({ success: true, delivered: true, message: "Scan instantly verified and pushed to PC client!" });
+    } catch (err) {
+      console.warn("Express push failed, storing payload as backup cache:", err);
+      res.json({ success: true, delivered: false, message: "Pushed stream dropped, stored in cache queue." });
+    }
+  } else {
+    res.json({ success: true, delivered: false, message: "Scanned data cached. PC is not listening to push stream." });
+  }
+});
+
+// Backup check/long-polling API if SSE fails (increases resiliency across restrictive corporate proxy firewalls)
+app.get("/api/session/:sessionId/status", (req, res) => {
+  const { sessionId } = req.params;
+  const scannedText = sessionData.get(sessionId) || null;
+  const isPcConnected = sseClients.has(sessionId);
+  
+  res.json({
+    sessionId,
+    isPcConnected,
+    scannedText,
+    status: scannedText ? "received" : (isPcConnected ? "connected" : "waiting")
+  });
+});
+
 // Vite Dev Server / Static files serving
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { 
+        middlewareMode: true,
+        hmr: false
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
