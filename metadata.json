@@ -1,0 +1,6 @@
+{
+  "name": "A-Chalan QR Code Verifier",
+  "description": "Scan and verify Bangladeshi A-Chalan printed receipts via camera or image upload, parse data, and export to Excel.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
